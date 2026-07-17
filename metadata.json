@@ -1,0 +1,6 @@
+{
+  "name": "Math Equation Scanner",
+  "description": "Upload images of mathematical equations to detect bounding boxes, extract coordinates, transcribe to LaTeX, and render them interactively.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

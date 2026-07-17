@@ -9,11 +9,13 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 
-// Load environment variables
+// Load environment variables. .env.local wins over .env (dotenv does not
+// override already-set vars), matching the key location the README documents.
+dotenv.config({ path: ".env.local" });
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Set up body parsers with elevated limits to support base64 image uploads
 app.use(express.json({ limit: "50mb" }));
@@ -100,6 +102,88 @@ async function callDeepSeekApi(messages: any[]): Promise<string> {
   return result.choices[0].message.content || "";
 }
 
+// Helper to make API requests to OpenRouter (OpenAI-compatible), which proxies
+// many models. `model` is a full OpenRouter model id, e.g. "openai/gpt-4o".
+async function callOpenRouterApi(messages: any[], model: string, isJson: boolean = false): Promise<string> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error("OpenRouter API key is missing. Please add OPENROUTER_API_KEY inside your Secrets panel / .env.local.");
+  }
+  if (!model) {
+    throw new Error("No OpenRouter model was specified.");
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+      // Optional attribution headers OpenRouter recommends.
+      "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
+      "X-Title": "Excalimath Lens"
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      ...(isJson ? { response_format: { type: "json_object" } } : {})
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenRouter API error (${response.status}): ${errorText}`);
+  }
+
+  const result = await response.json() as any;
+  return result.choices?.[0]?.message?.content || "";
+}
+
+// Parse a JSON payload that a model may have wrapped in prose or ```json fences.
+function parseJsonLoose(text: string): any {
+  if (!text) throw new Error("Empty response");
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Strip Markdown code fences, then fall back to the first {...} block.
+    const unfenced = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    try {
+      return JSON.parse(unfenced);
+    } catch {
+      const match = unfenced.match(/\{[\s\S]*\}/);
+      if (match) return JSON.parse(match[0]);
+      throw new Error("Response did not contain valid JSON");
+    }
+  }
+}
+
+// Split a LaTeX string that stacks several equations (Mathpix often wraps a
+// multi-line derivation in one `\begin{array}...\end{array}` / aligned block)
+// into one entry per visual row. Returns the individual row LaTeX strings.
+function splitLatexRows(latex: string): string[] {
+  if (!latex) return [];
+  const s = latex.trim();
+
+  // Detect a stacked-equation environment and pull out its body.
+  const envMatch = s.match(
+    /\\begin\{(array|aligned|align\*?|alignat\*?|gather\*?|gathered|split|eqnarray\*?)\}(?:\{[^}]*\})?([\s\S]*?)\\end\{\1\}/
+  );
+  const body = envMatch ? envMatch[2] : s;
+
+  const rows = body
+    .split(/\\\\/) // LaTeX row separator "\\"
+    .map((r) =>
+      r
+        .replace(/&/g, " ") // drop alignment markers so each row stands alone
+        .replace(/\\hline/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    )
+    .filter((r) => r.length > 0);
+
+  return rows.length > 0 ? rows : [s];
+}
+
 // Helper to clean math formatting from raw LaTeX strings
 function cleanLatex(latex: string): string {
   if (!latex) return "";
@@ -131,9 +215,11 @@ async function callMathpixApi(base64Data: string, mimeType: string): Promise<any
     body: JSON.stringify({
       src: `data:${mimeType};base64,${base64Data}`,
       formats: ["text", "data"],
+      // include_line_data is a TOP-LEVEL parameter, not part of data_options.
+      // When nested it is ignored and the response comes back with no line_data.
+      include_line_data: true,
       data_options: {
-        include_latex: true,
-        include_line_data: true
+        include_latex: true
       }
     })
   });
@@ -179,7 +265,19 @@ Answer the student's question clearly, thoroughly, and professionally.
     let answer = "";
 
     // Route based on tutor model preference
-    if (tutorModel === "deepseek" && process.env.DEEPSEEK_API_KEY) {
+    if (typeof tutorModel === "string" && tutorModel.startsWith("openrouter:")) {
+      try {
+        const orModel = tutorModel.slice("openrouter:".length);
+        const messages = [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: question }
+        ];
+        answer = await callOpenRouterApi(messages, orModel, false);
+      } catch (orError: any) {
+        console.warn("OpenRouter explanation failed, falling back to Gemini:", orError.message);
+        // Fallback to Gemini if OpenRouter fails or key is invalid
+      }
+    } else if (tutorModel === "deepseek" && process.env.DEEPSEEK_API_KEY) {
       try {
         const messages = [
           { role: "system", content: systemInstruction },
@@ -203,17 +301,22 @@ Answer the student's question clearly, thoroughly, and professionally.
       }
     }
 
-    // If Gemini was selected, or other models fell back
-    if (!answer) {
+    // Gemini — used when selected, or as a fallback when another provider
+    // failed, but ONLY when a Gemini key is configured.
+    if (!answer && process.env.GEMINI_API_KEY) {
       const ai = getAiClient();
       const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: question,
         config: {
           systemInstruction,
         },
       });
       answer = response.text || "No response received from Gemini.";
+    }
+
+    if (!answer) {
+      throw new Error("The AI tutor is unavailable. Pick an OpenRouter model in the header (and set OPENROUTER_API_KEY), or configure a Gemini key.");
     }
 
     res.json({ answer });
@@ -278,53 +381,90 @@ You must respond with valid JSON matching this schema:
     let ocrResultText = "";
     let actualOcrModelUsed = "gemini";
     let equations = [];
+    // Remember why the chosen OCR engine produced nothing, so we can surface a
+    // precise error instead of a misleading "Gemini key required" one.
+    let ocrError: Error | null = null;
 
     // 1. PERFORM OCR
-    if (ocrModel === "mathpix" && process.env.MATHPIX_APP_ID && process.env.MATHPIX_APP_KEY) {
+    if (ocrModel === "mathpix" && !(process.env.MATHPIX_APP_ID && process.env.MATHPIX_APP_KEY)) {
+      ocrError = new Error("Mathpix OCR is selected but MATHPIX_APP_ID / MATHPIX_APP_KEY are not set in .env.local.");
+    } else if (ocrModel === "mistral" && !process.env.MISTRAL_API_KEY) {
+      ocrError = new Error("Mistral OCR is selected but MISTRAL_API_KEY is not set in .env.local.");
+    } else if (ocrModel === "mathpix" && process.env.MATHPIX_APP_ID && process.env.MATHPIX_APP_KEY) {
       try {
         const mathpixData = await callMathpixApi(base64Data, mimeType);
         actualOcrModelUsed = "mathpix";
 
-        const lineItems = mathpixData.line_data || mathpixData.data || [];
-        const imageWidth = mathpixData.width || 1000;
-        const imageHeight = mathpixData.height || 1000;
+        const lineItems = mathpixData.line_data || [];
+        const imageWidth = mathpixData.image_width || mathpixData.width || 1000;
+        const imageHeight = mathpixData.image_height || mathpixData.height || 1000;
 
         let eqIndex = 1;
         for (const item of lineItems) {
-          const textVal = item.text || item.value || "";
-          if (!textVal.trim()) continue;
+          // Skip lines Mathpix flagged as excluded (page numbers, noise) or errored.
+          if (item.included === false) continue;
+          if (item.error_id) continue;
 
-          // Extract coordinates safely
-          const top_left_x = item.top_left_x ?? (item.position?.top_left_x ?? item.box?.xmin ?? 0);
-          const top_left_y = item.top_left_y ?? (item.position?.top_left_y ?? item.box?.ymin ?? 0);
-          const width = item.width ?? (item.position?.width ?? item.box?.width ?? 100);
-          const height = item.height ?? (item.position?.height ?? item.box?.height ?? 50);
+          const textVal = (item.text || item.value || "").trim();
+          if (!textVal) continue;
 
-          // Normalize coordinates to 0-1000 range
-          const xmin = Math.min(1000, Math.max(0, Math.round((top_left_x / imageWidth) * 1000)));
-          const ymin = Math.min(1000, Math.max(0, Math.round((top_left_y / imageHeight) * 1000)));
-          const xmax = Math.min(1000, Math.max(0, Math.round(((top_left_x + width) / imageWidth) * 1000)));
-          const ymax = Math.min(1000, Math.max(0, Math.round(((top_left_y + height) / imageHeight) * 1000)));
+          // Mathpix tags each line with a type; skip non-equation regions.
+          const lineType = item.type || "";
+          if (["diagram", "chart", "table"].includes(lineType)) continue;
 
-          // Clean up the LaTeX output
-          const latexVal = cleanLatex(textVal);
+          // Derive a pixel-space bounding box for the whole line_data block.
+          // The v3/text response gives each line a `cnt` contour: a list of
+          // [x, y] pixel pairs in clockwise [TL, TR, BR, BL] order. Fall back
+          // to older/alternate coord shapes.
+          let bx = 0, by = 0, bw = 100, bh = 50;
+          if (Array.isArray(item.cnt) && item.cnt.length > 0) {
+            const xs = item.cnt.map((p: number[]) => p[0]);
+            const ys = item.cnt.map((p: number[]) => p[1]);
+            bx = Math.min(...xs);
+            by = Math.min(...ys);
+            bw = Math.max(...xs) - bx;
+            bh = Math.max(...ys) - by;
+          } else {
+            const region = item.region || item.position || item.box || {};
+            bx = region.top_left_x ?? region.xmin ?? item.top_left_x ?? 0;
+            by = region.top_left_y ?? region.ymin ?? item.top_left_y ?? 0;
+            bw = region.width ?? item.width ?? 100;
+            bh = region.height ?? item.height ?? 50;
+          }
 
-          equations.push({
-            id: `eq_${eqIndex++}`,
-            latex: latexVal,
-            rawText: textVal,
-            explanation: `Mathematical expression parsed via Mathpix.`,
-            boundingBox: {
-              ymin,
-              xmin,
-              ymax,
-              xmax
-            }
+          const norm = (v: number, total: number) =>
+            Math.min(1000, Math.max(0, Math.round((v / total) * 1000)));
+
+          // line_data `text` is Mathpix Markdown (e.g. "\( x^2 = y \)"); strip
+          // the delimiters, then split a stacked derivation into one row each.
+          const cleaned = cleanLatex(textVal);
+          const rows = splitLatexRows(cleaned);
+          const rowCount = rows.length;
+
+          rows.forEach((rowLatex, r) => {
+            // Slice the block's height into equal bands, one per row, so each
+            // step gets its own bounding box that overlays the correct line.
+            const rowTop = by + (bh * r) / rowCount;
+            const rowBottom = by + (bh * (r + 1)) / rowCount;
+
+            equations.push({
+              id: `eq_${eqIndex++}`,
+              latex: rowLatex,
+              rawText: rowLatex,
+              explanation: `Mathematical expression parsed via Mathpix.`,
+              boundingBox: {
+                ymin: norm(rowTop, imageHeight),
+                xmin: norm(bx, imageWidth),
+                ymax: norm(rowBottom, imageHeight),
+                xmax: norm(bx + bw, imageWidth),
+              },
+            });
           });
         }
       } catch (mpOcrError: any) {
-        console.warn("Mathpix OCR failed, falling back to Gemini:", mpOcrError.message);
-        // Fall back to Gemini by letting equations stay empty
+        console.warn("Mathpix OCR failed:", mpOcrError.message);
+        ocrError = mpOcrError;
+        // Only Gemini (if configured) can serve as a fallback below.
       }
     } else if (ocrModel === "mistral" && process.env.MISTRAL_API_KEY) {
       try {
@@ -341,15 +481,18 @@ You must respond with valid JSON matching this schema:
         ocrResultText = await callMistralApi(messages, true);
         actualOcrModelUsed = "mistral";
       } catch (mOcrError: any) {
-        console.warn("Mistral OCR failed, falling back to Gemini:", mOcrError.message);
-        // will fall back to Gemini below
+        console.warn("Mistral OCR failed:", mOcrError.message);
+        ocrError = mOcrError;
+        // will fall back to Gemini below only if a Gemini key is configured
       }
     }
 
-    if (!ocrResultText && equations.length === 0) {
+    // Gemini OCR — used as the primary engine when ocrModel === "gemini", and as
+    // a fallback for the others, but ONLY when a Gemini API key is configured.
+    if (!ocrResultText && equations.length === 0 && process.env.GEMINI_API_KEY) {
       const ai = getAiClient();
       const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: [
           {
             inlineData: {
@@ -399,13 +542,28 @@ You must respond with valid JSON matching this schema:
       actualOcrModelUsed = "gemini";
     }
 
-    // Parse the structured OCR output if not using Mathpix (or if Mathpix fell back)
-    if (equations.length === 0) {
-      if (!ocrResultText) {
-        throw new Error("No response received from the OCR vision model");
+    // Parse the structured OCR output from a text-based engine (Gemini/Mistral).
+    if (equations.length === 0 && ocrResultText) {
+      try {
+        const parsedData = parseJsonLoose(ocrResultText);
+        equations = parsedData.equations || [];
+      } catch (parseErr: any) {
+        ocrError = new Error("The OCR model returned a response that could not be parsed as equations.");
       }
-      const parsedData = JSON.parse(ocrResultText.trim());
-      equations = parsedData.equations || [];
+    }
+
+    // If no engine produced equations, decide between a real error and an
+    // empty-but-valid result (e.g. Mathpix ran fine but found no math).
+    if (equations.length === 0) {
+      if (ocrError) {
+        throw ocrError;
+      }
+      if (ocrModel === "gemini" && !process.env.GEMINI_API_KEY) {
+        throw new Error("Gemini OCR is selected but GEMINI_API_KEY is not set. Switch the OCR engine to \"Mathpix API\" in the header, or add a Gemini key.");
+      }
+      // OCR succeeded but detected nothing — return an empty result cleanly.
+      res.json({ equations: [], ocrModelUsed: actualOcrModelUsed, tutorModelUsed: "none" });
+      return;
     }
 
     // 2. TUTOR STEP-BY-STEP MATHEMATICAL VALIDATION
@@ -449,9 +607,22 @@ You MUST respond with valid JSON matching this schema:
 }`;
 
     let validationResultText = "";
-    let actualTutorModelUsed = "gemini";
+    let actualTutorModelUsed = "none";
 
-    if (tutorModel === "deepseek" && process.env.DEEPSEEK_API_KEY) {
+    if (typeof tutorModel === "string" && tutorModel.startsWith("openrouter:")) {
+      try {
+        const orModel = tutorModel.slice("openrouter:".length);
+        const messages = [
+          { role: "system", content: "You are a precise mathematical validation engine. You only respond with JSON matching the requested schema." },
+          { role: "user", content: validationPrompt }
+        ];
+        validationResultText = await callOpenRouterApi(messages, orModel, true);
+        actualTutorModelUsed = tutorModel;
+      } catch (orValError: any) {
+        console.warn("OpenRouter validation failed, falling back to Gemini:", orValError.message);
+        // fallback to Gemini below
+      }
+    } else if (tutorModel === "deepseek" && process.env.DEEPSEEK_API_KEY) {
       try {
         const messages = [
           { role: "system", content: "You are a precise mathematical validation engine. You only respond with JSON matching the requested schema." },
@@ -476,10 +647,12 @@ You MUST respond with valid JSON matching this schema:
       }
     }
 
-    if (!validationResultText) {
+    // Gemini validation fallback — only when a Gemini key is configured.
+    // Otherwise validation is simply skipped and every step is marked neutral.
+    if (!validationResultText && process.env.GEMINI_API_KEY) {
       const ai = getAiClient();
       const resValidation = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: validationPrompt,
         config: {
           responseMimeType: "application/json",
@@ -509,7 +682,7 @@ You MUST respond with valid JSON matching this schema:
 
     let validationsMap: Record<string, { status: "correct" | "incorrect" | "neutral", feedback: string }> = {};
     try {
-      const parsedValidations = JSON.parse(validationResultText.trim());
+      const parsedValidations = parseJsonLoose(validationResultText);
       if (parsedValidations && Array.isArray(parsedValidations.validations)) {
         for (const v of parsedValidations.validations) {
           validationsMap[v.id] = {

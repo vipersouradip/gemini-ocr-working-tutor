@@ -22,10 +22,32 @@ import {
   PenTool,
 } from "lucide-react";
 
+// Curated OpenRouter tutor models. `id` is the OpenRouter model slug; any other
+// model can be reached via the "Custom model…" option. Edit this list freely.
+const OPENROUTER_TUTOR_MODELS: { id: string; label: string }[] = [
+  { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5" },
+  { id: "anthropic/claude-opus-4.8", label: "Claude Opus 4.8" },
+  { id: "openai/gpt-4.1", label: "GPT-4.1" },
+  { id: "openai/gpt-4o", label: "GPT-4o" },
+  { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  { id: "deepseek/deepseek-chat-v3.1", label: "DeepSeek V3.1" },
+  { id: "meta-llama/llama-3.3-70b-instruct", label: "Llama 3.3 70B" },
+  { id: "x-ai/grok-4.5", label: "Grok 4.5" },
+];
+
 export default function App() {
   const [activeMode, setActiveMode] = useState<"chalkboard" | "upload">("chalkboard");
-  const [ocrModel, setOcrModel] = useState<OcrModelType>("gemini");
-  const [tutorModel, setTutorModel] = useState<TutorModelType>("gemini");
+  const [ocrModel, setOcrModel] = useState<OcrModelType>("mathpix");
+  // `tutorSelection` is the raw dropdown value; "openrouter:custom" reveals a
+  // free-text field. `tutorModel` is the resolved value sent to the server.
+  const [tutorSelection, setTutorSelection] = useState<string>("openrouter:anthropic/claude-sonnet-5");
+  const [customTutorModel, setCustomTutorModel] = useState<string>("");
+  const tutorModel: TutorModelType =
+    tutorSelection === "openrouter:custom"
+      ? (customTutorModel.trim()
+          ? (`openrouter:${customTutorModel.trim()}` as TutorModelType)
+          : "gemini")
+      : (tutorSelection as TutorModelType);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [mimeType, setMimeType] = useState<string>("");
   const [equations, setEquations] = useState<Equation[]>([]);
@@ -221,7 +243,7 @@ export default function App() {
                 onChange={(e) => setOcrModel(e.target.value as OcrModelType)}
                 className="bg-transparent text-slate-200 focus:outline-none cursor-pointer font-semibold hover:text-indigo-400 transition-colors"
               >
-                <option value="gemini" className="bg-slate-950 text-slate-100">Gemini 3.5 Flash</option>
+                <option value="gemini" className="bg-slate-950 text-slate-100">Gemini 2.5 Flash</option>
                 <option value="mathpix" className="bg-slate-950 text-slate-100">Mathpix API</option>
                 <option value="mistral" className="bg-slate-950 text-slate-100">Mistral Pixtral (Vision)</option>
               </select>
@@ -231,15 +253,37 @@ export default function App() {
             <div className="flex items-center gap-1.5 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-800 text-xs shadow-inner">
               <span className="text-[9px] text-slate-500 font-extrabold uppercase font-mono tracking-wider">Tutor AI</span>
               <select
-                value={tutorModel}
-                onChange={(e) => setTutorModel(e.target.value as TutorModelType)}
+                value={tutorSelection}
+                onChange={(e) => setTutorSelection(e.target.value)}
                 className="bg-transparent text-slate-200 focus:outline-none cursor-pointer font-semibold hover:text-indigo-400 transition-colors"
               >
-                <option value="gemini" className="bg-slate-950 text-slate-100">Gemini 3.5 Flash</option>
-                <option value="deepseek" className="bg-slate-950 text-slate-100">DeepSeek Chat (V3)</option>
-                <option value="mistral" className="bg-slate-950 text-slate-100">Mistral Large</option>
+                <optgroup label="Direct" className="bg-slate-950 text-slate-100">
+                  <option value="gemini" className="bg-slate-950 text-slate-100">Gemini 2.5 Flash</option>
+                  <option value="deepseek" className="bg-slate-950 text-slate-100">DeepSeek Chat (V3)</option>
+                  <option value="mistral" className="bg-slate-950 text-slate-100">Mistral Large</option>
+                </optgroup>
+                <optgroup label="OpenRouter" className="bg-slate-950 text-slate-100">
+                  {OPENROUTER_TUTOR_MODELS.map((m) => (
+                    <option key={m.id} value={`openrouter:${m.id}`} className="bg-slate-950 text-slate-100">
+                      {m.label}
+                    </option>
+                  ))}
+                  <option value="openrouter:custom" className="bg-slate-950 text-slate-100">Custom model…</option>
+                </optgroup>
               </select>
             </div>
+
+            {/* Custom OpenRouter model id input */}
+            {tutorSelection === "openrouter:custom" && (
+              <input
+                type="text"
+                value={customTutorModel}
+                onChange={(e) => setCustomTutorModel(e.target.value)}
+                placeholder="openrouter model id, e.g. anthropic/claude-sonnet-4.5"
+                spellCheck={false}
+                className="bg-slate-900 px-3 py-2 rounded-xl border border-slate-800 focus:border-indigo-500 focus:outline-none text-xs text-slate-100 placeholder-slate-500 font-mono w-64 shadow-inner"
+              />
+            )}
 
             {imageUrl && (
               <button

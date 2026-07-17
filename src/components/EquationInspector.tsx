@@ -385,7 +385,7 @@ export default function EquationInspector({
                       className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/10"
                     >
                       <Sparkles className="w-4 h-4" />
-                      Explore with Gemini AI Tutor
+                      Explore with AI Tutor
                     </button>
                   </div>
                 </div>
@@ -433,7 +433,7 @@ export default function EquationInspector({
                           <Sparkles className="w-4 h-4" />
                         </div>
                         <div className="space-y-1">
-                          <p className="text-xs font-semibold text-slate-200">Gemini Math Assistant</p>
+                          <p className="text-xs font-semibold text-slate-200">AI Math Assistant</p>
                           <p className="text-xs text-slate-400 leading-relaxed">
                             I can explain the derivation, break down the terms and units, or provide solvable exercises for this equation. Select a study guide below:
                           </p>

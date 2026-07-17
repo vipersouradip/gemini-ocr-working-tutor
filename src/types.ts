@@ -20,7 +20,9 @@ export interface BoundingBox {
 }
 
 export type OcrModelType = "gemini" | "mistral" | "mathpix";
-export type TutorModelType = "gemini" | "deepseek" | "mistral";
+// Built-in tutor providers, plus any OpenRouter model addressed as
+// `openrouter:<model-id>` (e.g. "openrouter:anthropic/claude-3.5-sonnet").
+export type TutorModelType = "gemini" | "deepseek" | "mistral" | `openrouter:${string}`;
 
 export interface Equation {
   id: string;

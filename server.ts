@@ -5,6 +5,7 @@
 
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
@@ -20,6 +21,170 @@ const PORT = Number(process.env.PORT) || 3000;
 // Set up body parsers with elevated limits to support base64 image uploads
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// ---------------------------------------------------------------------------
+// Practice question store (managed from the /admin panel)
+// ---------------------------------------------------------------------------
+// Questions are persisted to a JSON file on disk so the /admin CRUD survives
+// restarts and every client (and the Myyra tutor) sees the same set.
+const DATA_DIR = path.join(process.cwd(), "data");
+const QUESTIONS_FILE = path.join(DATA_DIR, "questions.json");
+
+interface StoredQuestion {
+  id: string;
+  title: string;
+  questionType: "mcq" | "msq";
+  subject: string;
+  topic: string;
+  subtopic: string;
+  difficulty?: "" | "easy" | "medium" | "hard";
+  prompt: string;
+  questionImage?: string;
+  options: string[];
+  correctOptions: number[];
+  answer?: string;
+  answerImage?: string;
+}
+
+// Default questions seeded on first run (includes the quadratic from the design).
+const SEED_QUESTIONS: StoredQuestion[] = [
+  {
+    id: "quadratic-1",
+    title: "Quadratic formula",
+    questionType: "msq",
+    subject: "Mathematics",
+    topic: "Algebra",
+    subtopic: "Quadratic equations",
+    difficulty: "easy",
+    prompt: "$x^2 - 5x + 6 = 0$",
+    options: ["x = 2", "x = 3", "x = 1", "x = 6"],
+    correctOptions: [0, 1],
+    answer: "Factor as $(x-2)(x-3)=0$, giving $x=2$ or $x=3$.",
+  },
+  {
+    id: "kinematics-velocity",
+    title: "Final velocity",
+    questionType: "mcq",
+    subject: "Physics",
+    topic: "Kinematics",
+    subtopic: "Uniform acceleration",
+    difficulty: "easy",
+    prompt: "A car starts from rest and accelerates uniformly at $2\\ \\text{m/s}^2$ for $5\\ \\text{s}$. What is its final velocity?",
+    options: ["5 m/s", "10 m/s", "12 m/s", "20 m/s"],
+    correctOptions: [1],
+    answer: "$v = u + at = 0 + 2\\times5 = 10\\ \\text{m/s}$.",
+  },
+  {
+    id: "newtons-second-law",
+    title: "Net force",
+    questionType: "mcq",
+    subject: "Physics",
+    topic: "Forces",
+    subtopic: "Newton's second law",
+    difficulty: "easy",
+    prompt: "A net force accelerates a $4\\ \\text{kg}$ block at $3\\ \\text{m/s}^2$. What is the magnitude of the net force?",
+    options: ["1.33 N", "7 N", "12 N", "24 N"],
+    correctOptions: [2],
+    answer: "$F = ma = 4\\times3 = 12\\ \\text{N}$.",
+  },
+  {
+    id: "kinetic-energy",
+    title: "Kinetic energy",
+    questionType: "mcq",
+    subject: "Physics",
+    topic: "Energy",
+    subtopic: "Kinetic energy",
+    difficulty: "easy",
+    prompt: "What is the kinetic energy of a $2\\ \\text{kg}$ object moving at $3\\ \\text{m/s}$?",
+    options: ["3 J", "6 J", "9 J", "18 J"],
+    correctOptions: [2],
+    answer: "$KE = \\tfrac12 m v^2 = \\tfrac12\\times2\\times9 = 9\\ \\text{J}$.",
+  },
+  {
+    id: "free-fall-time",
+    title: "Free fall time",
+    questionType: "mcq",
+    subject: "Physics",
+    topic: "Kinematics",
+    subtopic: "Free fall",
+    difficulty: "medium",
+    prompt: "An object is dropped from rest and falls $45\\ \\text{m}$. Taking $g = 10\\ \\text{m/s}^2$, how long does it take to reach the ground?",
+    options: ["2 s", "3 s", "4.5 s", "9 s"],
+    correctOptions: [1],
+    answer: "$h = \\tfrac12 g t^2 \\Rightarrow t = \\sqrt{2h/g} = \\sqrt{9} = 3\\ \\text{s}$.",
+  },
+];
+
+function ensureQuestionsFile(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(QUESTIONS_FILE)) {
+      fs.writeFileSync(QUESTIONS_FILE, JSON.stringify(SEED_QUESTIONS, null, 2), "utf8");
+    }
+  } catch (e: any) {
+    console.error("Failed to initialize questions store:", e.message);
+  }
+}
+
+function readQuestions(): StoredQuestion[] {
+  try {
+    ensureQuestionsFile();
+    const raw = fs.readFileSync(QUESTIONS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e: any) {
+    console.error("Failed to read questions:", e.message);
+    return [];
+  }
+}
+
+function writeQuestions(questions: StoredQuestion[]): void {
+  ensureQuestionsFile();
+  fs.writeFileSync(QUESTIONS_FILE, JSON.stringify(questions, null, 2), "utf8");
+}
+
+// Normalize a client payload into a StoredQuestion (defensive defaults).
+function normalizeQuestion(body: any, id: string): StoredQuestion {
+  const options: string[] = Array.isArray(body.options)
+    ? body.options.map((o: any) => String(o ?? ""))
+    : [];
+
+  // Accept correct answers as `correctOptions` (indices) or a friendlier
+  // `correct` alias that may hold indices OR option letters ("A", "C", ...).
+  const rawCorrect = Array.isArray(body.correctOptions)
+    ? body.correctOptions
+    : body.correct !== undefined
+      ? (Array.isArray(body.correct) ? body.correct : [body.correct])
+      : [];
+  let correctOptions: number[] = rawCorrect
+    .map((v: any) => {
+      if (typeof v === "string" && /^[A-Za-z]$/.test(v.trim())) {
+        return v.trim().toUpperCase().charCodeAt(0) - 65; // "A" -> 0
+      }
+      return Number(v);
+    })
+    .filter((n: number) => Number.isInteger(n) && n >= 0 && n < options.length);
+  // De-duplicate.
+  correctOptions = Array.from(new Set(correctOptions));
+  const questionType = body.questionType === "msq" ? "msq" : "mcq";
+  // MCQ keeps at most one correct option.
+  if (questionType === "mcq" && correctOptions.length > 1) correctOptions = [correctOptions[0]];
+  return {
+    id,
+    title: String(body.title ?? "").trim() || "Untitled question",
+    questionType,
+    subject: String(body.subject ?? "").trim(),
+    topic: String(body.topic ?? "").trim(),
+    subtopic: String(body.subtopic ?? "").trim(),
+    difficulty: ["easy", "medium", "hard"].includes(body.difficulty) ? body.difficulty : "",
+    prompt: String(body.prompt ?? ""),
+    questionImage: body.questionImage || undefined,
+    options,
+    correctOptions,
+    answer: body.answer ? String(body.answer) : undefined,
+    answerImage: body.answerImage || undefined,
+  };
+}
 
 // Initialize Gemini Client Lazily/Safely
 let aiClient: GoogleGenAI | null = null;
@@ -232,9 +397,211 @@ async function callMathpixApi(base64Data: string, mimeType: string): Promise<any
   return response.json();
 }
 
+// Run Mathpix OCR and return one entry per visual line, each with a normalized
+// (0-1000) bounding box. Stacked derivations (a single `\begin{array}` block)
+// are split into individual rows so each step gets its own box. Shared by the
+// equation scanner and the Myyra practice tutor.
+async function mathpixToLines(
+  base64Data: string,
+  mimeType: string
+): Promise<Array<{ latex: string; rawText: string; boundingBox: { ymin: number; xmin: number; ymax: number; xmax: number } }>> {
+  const mathpixData: any = await callMathpixApi(base64Data, mimeType);
+
+  const lineItems = mathpixData.line_data || [];
+  const imageWidth = mathpixData.image_width || mathpixData.width || 1000;
+  const imageHeight = mathpixData.image_height || mathpixData.height || 1000;
+
+  const norm = (v: number, total: number) =>
+    Math.min(1000, Math.max(0, Math.round((v / total) * 1000)));
+
+  const out: Array<{ latex: string; rawText: string; boundingBox: { ymin: number; xmin: number; ymax: number; xmax: number } }> = [];
+
+  for (const item of lineItems) {
+    // Skip lines Mathpix flagged as excluded (page numbers, noise) or errored.
+    if (item.included === false) continue;
+    if (item.error_id) continue;
+
+    const textVal = (item.text || item.value || "").trim();
+    if (!textVal) continue;
+
+    // Mathpix tags each line with a type; skip non-equation regions.
+    const lineType = item.type || "";
+    if (["diagram", "chart", "table"].includes(lineType)) continue;
+
+    // Derive a pixel-space bounding box for the whole line_data block. The
+    // v3/text response gives each line a `cnt` contour of [x, y] pixel pairs;
+    // fall back to older/alternate coord shapes.
+    let bx = 0, by = 0, bw = 100, bh = 50;
+    if (Array.isArray(item.cnt) && item.cnt.length > 0) {
+      const xs = item.cnt.map((p: number[]) => p[0]);
+      const ys = item.cnt.map((p: number[]) => p[1]);
+      bx = Math.min(...xs);
+      by = Math.min(...ys);
+      bw = Math.max(...xs) - bx;
+      bh = Math.max(...ys) - by;
+    } else {
+      const region = item.region || item.position || item.box || {};
+      bx = region.top_left_x ?? region.xmin ?? item.top_left_x ?? 0;
+      by = region.top_left_y ?? region.ymin ?? item.top_left_y ?? 0;
+      bw = region.width ?? item.width ?? 100;
+      bh = region.height ?? item.height ?? 50;
+    }
+
+    // line_data `text` is Mathpix Markdown (e.g. "\( x^2 = y \)"); strip the
+    // delimiters, then split a stacked derivation into one row each and slice
+    // the block's height into equal bands so each row overlays its own line.
+    const cleaned = cleanLatex(textVal);
+    const rows = splitLatexRows(cleaned);
+    const rowCount = rows.length;
+
+    rows.forEach((rowLatex, r) => {
+      const rowTop = by + (bh * r) / rowCount;
+      const rowBottom = by + (bh * (r + 1)) / rowCount;
+      out.push({
+        latex: rowLatex,
+        rawText: rowLatex,
+        boundingBox: {
+          ymin: norm(rowTop, imageHeight),
+          xmin: norm(bx, imageWidth),
+          ymax: norm(rowBottom, imageHeight),
+          xmax: norm(bx + bw, imageWidth),
+        },
+      });
+    });
+  }
+
+  return out;
+}
+
+// Route a tutoring request to the selected provider and return the raw text
+// response. Honors the "Gemini is optional" rule: Gemini is only used when a
+// GEMINI_API_KEY is configured (as the selection or a last-resort fallback).
+async function runTutor(
+  systemInstruction: string,
+  userContent: string,
+  tutorModel: string,
+  wantJson: boolean
+): Promise<string> {
+  const messages = [
+    { role: "system", content: systemInstruction },
+    { role: "user", content: userContent },
+  ];
+
+  if (typeof tutorModel === "string" && tutorModel.startsWith("openrouter:")) {
+    try {
+      const model = tutorModel.slice("openrouter:".length);
+      return await callOpenRouterApi(messages, model, wantJson);
+    } catch (e: any) {
+      console.warn("OpenRouter tutor failed, trying fallback:", e.message);
+    }
+  } else if (tutorModel === "deepseek" && process.env.DEEPSEEK_API_KEY) {
+    try {
+      return await callDeepSeekApi(messages);
+    } catch (e: any) {
+      console.warn("DeepSeek tutor failed, trying fallback:", e.message);
+    }
+  } else if (tutorModel === "mistral" && process.env.MISTRAL_API_KEY) {
+    try {
+      // Mistral chat has no dedicated system role slot here; fold it into user.
+      return await callMistralApi(
+        [{ role: "user", content: `${systemInstruction}\n\n${userContent}` }],
+        wantJson
+      );
+    } catch (e: any) {
+      console.warn("Mistral tutor failed, trying fallback:", e.message);
+    }
+  }
+
+  // Gemini — selection or fallback, but only when a key is configured.
+  if (process.env.GEMINI_API_KEY) {
+    const ai = getAiClient();
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: userContent,
+      config: {
+        systemInstruction,
+        ...(wantJson ? { responseMimeType: "application/json" } : {}),
+      },
+    });
+    return response.text || "";
+  }
+
+  throw new Error(
+    "The AI tutor is unavailable. Pick an OpenRouter model in the header (and set OPENROUTER_API_KEY), or configure a Gemini key."
+  );
+}
+
 // API Routes
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// --- Practice question CRUD (used by /admin and the practice solver) ---
+app.get("/api/questions", (req, res) => {
+  res.json({ questions: readQuestions() });
+});
+
+app.post("/api/questions", (req, res) => {
+  try {
+    const questions = readQuestions();
+    const id = `q_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const question = normalizeQuestion(req.body, id);
+    questions.push(question);
+    writeQuestions(questions);
+    res.status(201).json({ question });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || "Failed to create question." });
+  }
+});
+
+// Bulk import: accepts { questions: [...] } and creates them all at once.
+app.post("/api/questions/bulk", (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body?.questions) ? req.body.questions : [];
+    if (incoming.length === 0) {
+      res.status(400).json({ error: "Provide a non-empty 'questions' array." });
+      return;
+    }
+    const questions = readQuestions();
+    const created: StoredQuestion[] = [];
+    incoming.forEach((q: any, i: number) => {
+      const id = `q_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`;
+      const normalized = normalizeQuestion(q, id);
+      questions.push(normalized);
+      created.push(normalized);
+    });
+    writeQuestions(questions);
+    res.status(201).json({ created: created.length, questions: created });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || "Failed to import questions." });
+  }
+});
+
+app.put("/api/questions/:id", (req, res) => {
+  try {
+    const questions = readQuestions();
+    const idx = questions.findIndex((q) => q.id === req.params.id);
+    if (idx === -1) {
+      res.status(404).json({ error: "Question not found." });
+      return;
+    }
+    questions[idx] = normalizeQuestion(req.body, req.params.id);
+    writeQuestions(questions);
+    res.json({ question: questions[idx] });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || "Failed to update question." });
+  }
+});
+
+app.delete("/api/questions/:id", (req, res) => {
+  try {
+    const questions = readQuestions();
+    const next = questions.filter((q) => q.id !== req.params.id);
+    writeQuestions(next);
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || "Failed to delete question." });
+  }
 });
 
 // Endpoint to explain or tutor the user about a selected equation
@@ -392,75 +759,15 @@ You must respond with valid JSON matching this schema:
       ocrError = new Error("Mistral OCR is selected but MISTRAL_API_KEY is not set in .env.local.");
     } else if (ocrModel === "mathpix" && process.env.MATHPIX_APP_ID && process.env.MATHPIX_APP_KEY) {
       try {
-        const mathpixData = await callMathpixApi(base64Data, mimeType);
+        const lines = await mathpixToLines(base64Data, mimeType);
         actualOcrModelUsed = "mathpix";
-
-        const lineItems = mathpixData.line_data || [];
-        const imageWidth = mathpixData.image_width || mathpixData.width || 1000;
-        const imageHeight = mathpixData.image_height || mathpixData.height || 1000;
-
-        let eqIndex = 1;
-        for (const item of lineItems) {
-          // Skip lines Mathpix flagged as excluded (page numbers, noise) or errored.
-          if (item.included === false) continue;
-          if (item.error_id) continue;
-
-          const textVal = (item.text || item.value || "").trim();
-          if (!textVal) continue;
-
-          // Mathpix tags each line with a type; skip non-equation regions.
-          const lineType = item.type || "";
-          if (["diagram", "chart", "table"].includes(lineType)) continue;
-
-          // Derive a pixel-space bounding box for the whole line_data block.
-          // The v3/text response gives each line a `cnt` contour: a list of
-          // [x, y] pixel pairs in clockwise [TL, TR, BR, BL] order. Fall back
-          // to older/alternate coord shapes.
-          let bx = 0, by = 0, bw = 100, bh = 50;
-          if (Array.isArray(item.cnt) && item.cnt.length > 0) {
-            const xs = item.cnt.map((p: number[]) => p[0]);
-            const ys = item.cnt.map((p: number[]) => p[1]);
-            bx = Math.min(...xs);
-            by = Math.min(...ys);
-            bw = Math.max(...xs) - bx;
-            bh = Math.max(...ys) - by;
-          } else {
-            const region = item.region || item.position || item.box || {};
-            bx = region.top_left_x ?? region.xmin ?? item.top_left_x ?? 0;
-            by = region.top_left_y ?? region.ymin ?? item.top_left_y ?? 0;
-            bw = region.width ?? item.width ?? 100;
-            bh = region.height ?? item.height ?? 50;
-          }
-
-          const norm = (v: number, total: number) =>
-            Math.min(1000, Math.max(0, Math.round((v / total) * 1000)));
-
-          // line_data `text` is Mathpix Markdown (e.g. "\( x^2 = y \)"); strip
-          // the delimiters, then split a stacked derivation into one row each.
-          const cleaned = cleanLatex(textVal);
-          const rows = splitLatexRows(cleaned);
-          const rowCount = rows.length;
-
-          rows.forEach((rowLatex, r) => {
-            // Slice the block's height into equal bands, one per row, so each
-            // step gets its own bounding box that overlays the correct line.
-            const rowTop = by + (bh * r) / rowCount;
-            const rowBottom = by + (bh * (r + 1)) / rowCount;
-
-            equations.push({
-              id: `eq_${eqIndex++}`,
-              latex: rowLatex,
-              rawText: rowLatex,
-              explanation: `Mathematical expression parsed via Mathpix.`,
-              boundingBox: {
-                ymin: norm(rowTop, imageHeight),
-                xmin: norm(bx, imageWidth),
-                ymax: norm(rowBottom, imageHeight),
-                xmax: norm(bx + bw, imageWidth),
-              },
-            });
-          });
-        }
+        equations = lines.map((line, i) => ({
+          id: `eq_${i + 1}`,
+          latex: line.latex,
+          rawText: line.rawText,
+          explanation: `Mathematical expression parsed via Mathpix.`,
+          boundingBox: line.boundingBox,
+        }));
       } catch (mpOcrError: any) {
         console.warn("Mathpix OCR failed:", mpOcrError.message);
         ocrError = mpOcrError;
@@ -714,6 +1021,132 @@ You MUST respond with valid JSON matching this schema:
     console.error("Error analyzing equations:", error);
     res.status(500).json({
       error: error.message || "An error occurred while scanning the image for equations.",
+    });
+  }
+});
+
+// Endpoint powering the "Myyra" practice tutor. Given the current MCQ, the
+// student's handwritten steps (OCR'd), and their chat message, Myyra returns a
+// structured reply: a chat message, per-step marks (correct/incorrect/neutral)
+// with progressive hints, and optional short notes to write on the whiteboard.
+app.post("/api/myyra", async (req, res) => {
+  try {
+    const { image, mimeType = "image/png", question, message, history = [], tutorModel = "gemini" } = req.body;
+
+    if (!question || !question.prompt || !Array.isArray(question.options)) {
+      res.status(400).json({ error: "Missing or invalid question payload." });
+      return;
+    }
+    if (!message || !String(message).trim()) {
+      res.status(400).json({ error: "Missing student message." });
+      return;
+    }
+
+    // 1. OCR the student's handwritten steps (if an image was supplied and
+    //    Mathpix is configured). Failures here are non-fatal: Myyra can still
+    //    answer conceptually without seeing the board.
+    let lines: Array<{ index: number; latex: string; boundingBox: any }> = [];
+    if (image && process.env.MATHPIX_APP_ID && process.env.MATHPIX_APP_KEY) {
+      try {
+        const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
+        const ocr = await mathpixToLines(base64Data, mimeType);
+        lines = ocr.map((l, i) => ({ index: i, latex: l.latex, boundingBox: l.boundingBox }));
+      } catch (ocrErr: any) {
+        console.warn("Myyra OCR failed (continuing without steps):", ocrErr.message);
+      }
+    }
+
+    // 2. Build Myyra's persona + strict JSON contract.
+    const systemInstruction = `You are "Myyra", a warm, patient, encouraging tutor. A student is solving a practice problem step by step by hand on a whiteboard; we OCR their steps for you. You are given the full question metadata (subject, topic, subtopic, difficulty, the answer choices, the correct option(s), and a reference answer). USE all of this to tailor your guidance, but treat the correct option(s) and reference answer as SECRET.
+
+Core principles:
+- Be Socratic and supportive, and pitch your help to the question's subject/topic and difficulty.
+- NEVER state which option is correct, and NEVER hand over the full worked solution or the reference answer, unless the student has clearly and repeatedly (3+ times) demanded the final answer.
+- Prefer nudges. Your FIRST hint for any mistake must be gentle — for example, remind the student of a formula or concept they seem to have forgotten — NOT the answer. Provide escalating hint levels (2-3), each more specific, the last most revealing.
+- Only mark a step "incorrect" when you are confident it contains an actual error. Mark clearly valid steps "correct". Mark restatements of the problem or definitions "neutral".
+- For MSQ (multiple correct answers) questions, remember more than one option can be correct.
+- Encourage the student to reach the answer themselves.
+
+You MUST respond with ONLY valid JSON (no prose outside it, no code fences) in exactly this shape:
+{
+  "reply": "your chat message to the student; may use $...$ LaTeX and light markdown",
+  "marks": [ { "index": <step index integer>, "status": "correct" | "incorrect" | "neutral", "hints": ["gentle nudge", "more specific", "most revealing"] } ],
+  "annotations": [ { "position": "below" | "beside" | "end", "afterIndex": <step index this note attaches to, or -1 for the end>, "text": "SHORT single-line note to write on the board, e.g. a formula" } ]
+}
+
+Rules:
+- "marks": include an entry for each step you can assess by its index. "hints" is only needed for "incorrect" steps (order them gentle -> revealing); use [] for correct/neutral steps.
+- "annotations": OPTIONAL and usually empty. Only add one when writing on the board genuinely helps (e.g. a forgotten formula placed under the relevant step). Keep "text" short enough to fit on one line. Use "below" to place it under a step (other content reflows down to make room), "beside" to place it to the right of a step, "end" to append at the bottom.
+- If the student only asked for a hint, it is fine to return "marks": [] and put the hint in "reply" and/or one small annotation.`;
+
+    const options: string[] = Array.isArray(question.options) ? question.options : [];
+    const optionsBlock = options.length
+      ? options.map((o: string, i: number) => `${String.fromCharCode(65 + i)}) ${o}`).join("\n")
+      : "(no options provided)";
+
+    // Correct option(s): prefer the new correctOptions array, fall back to a
+    // legacy single correctIndex if that's all the client sent.
+    let correctOptions: number[] = Array.isArray(question.correctOptions)
+      ? question.correctOptions
+      : typeof question.correctIndex === "number"
+        ? [question.correctIndex]
+        : [];
+    const correctLetters = correctOptions
+      .map((i) => String.fromCharCode(65 + i))
+      .join(", ");
+
+    const metaBlock = [
+      question.subject ? `Subject: ${question.subject}` : "",
+      question.topic ? `Topic: ${question.topic}` : "",
+      question.subtopic ? `Subtopic: ${question.subtopic}` : "",
+      question.difficulty ? `Difficulty: ${question.difficulty}` : "",
+      `Type: ${question.questionType === "msq" ? "MSQ (one or more correct)" : "MCQ (one correct)"}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const stepsBlock = lines.length
+      ? lines.map((l) => `[${l.index}] ${l.latex}`).join("\n")
+      : "(The student has not written any steps yet.)";
+
+    const historyBlock = Array.isArray(history) && history.length
+      ? history.map((h: any) => `${h.role === "myyra" ? "Myyra" : "Student"}: ${h.text}`).join("\n")
+      : "(no prior conversation)";
+
+    const imageNote = [
+      question.questionImage ? "(This question includes an image the student can see.)" : "",
+      question.answerImage ? "(The reference answer includes an image, kept secret from the student.)" : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const userContent = `QUESTION METADATA:\n${metaBlock}\n\nQUESTION:\n${question.prompt}${imageNote ? `\n${imageNote}` : ""}\n\nOPTIONS:\n${optionsBlock}\n\nCORRECT OPTION(S) (SECRET — never reveal directly): ${correctLetters || "(unspecified)"}\n\nREFERENCE ANSWER (SECRET — use to judge steps, do not reveal): ${question.answer || "(none provided)"}\n\nSTUDENT'S HANDWRITTEN STEPS (OCR, indexed top-to-bottom):\n${stepsBlock}\n\nCONVERSATION SO FAR:\n${historyBlock}\n\nSTUDENT'S LATEST MESSAGE:\n${message}`;
+
+    // 3. Ask the selected tutor model for the structured response.
+    const raw = await runTutor(systemInstruction, userContent, tutorModel, true);
+
+    let parsed: any = {};
+    try {
+      parsed = parseJsonLoose(raw);
+    } catch (parseErr: any) {
+      // If the model didn't return clean JSON, degrade gracefully to a chat-only reply.
+      console.warn("Myyra response was not valid JSON:", parseErr.message);
+      parsed = { reply: raw || "Sorry, I had trouble forming a response. Could you rephrase?", marks: [], annotations: [] };
+    }
+
+    const marks = Array.isArray(parsed.marks) ? parsed.marks : [];
+    const annotations = Array.isArray(parsed.annotations) ? parsed.annotations : [];
+
+    res.json({
+      reply: parsed.reply || "",
+      marks,
+      annotations,
+      lines,
+    });
+  } catch (error: any) {
+    console.error("Error in Myyra tutor:", error);
+    res.status(500).json({
+      error: error.message || "An error occurred while talking to Myyra.",
     });
   }
 });

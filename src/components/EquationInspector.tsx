@@ -6,7 +6,7 @@
 import React, { useState, useEffect } from "react";
 import { Equation } from "../types";
 import katex from "katex";
-import Markdown from "react-markdown";
+import MathMarkdown from "./MathMarkdown";
 import {
   BookOpen,
   Code,
@@ -488,7 +488,7 @@ export default function EquationInspector({
                             }`}
                           >
                             {chat.role === "model" ? (
-                              <Markdown>{chat.text}</Markdown>
+                              <MathMarkdown>{chat.text}</MathMarkdown>
                             ) : (
                               chat.text
                             )}
